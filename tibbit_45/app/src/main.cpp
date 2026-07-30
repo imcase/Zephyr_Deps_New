@@ -66,7 +66,7 @@ extern "C" time_t timeutil_timegm(const struct tm *tm);
 #include <cmath>
 
 
-/* This part belongs to CELLULAR - START: includes */
+/* *** This part belongs to CELLULAR - START: includes */
 #include <cstdlib>
 #include <zephyr/devicetree.h>
 #include "tb45_cellular.h"
@@ -77,7 +77,7 @@ extern "C" time_t timeutil_timegm(const struct tm *tm);
 #include "tb45_sms_event.h"
 #endif
 
-/* This part belongs to CELLULAR - END: includes */
+/* *** This part belongs to CELLULAR - END: includes */
 
 
 LOG_MODULE_REGISTER(app);
@@ -285,7 +285,7 @@ static bool dhcp_enabled = false;
 
 
 
-/* This part belongs to CELLULAR - START: globals, constants, and declarations */
+/* *** This part belongs to CELLULAR - START: globals, constants, and declarations */
 
 /* Cellular runtime config */
 /* NOTE: should you see this warning: <wrn> modem_cellular_custom: AT+COPS failed for carrier_id 46692 (: 30); continuing with modem default operator selection 
@@ -316,7 +316,7 @@ static void app_sms_recover_stored_unread_messages(void);
 static void app_queue_ppp_sms_test_batch(void);
 #endif
 
-/* This part belongs to CELLULAR - END: globals, constants, and declarations */
+/* *** This part belongs to CELLULAR - END: globals, constants, and declarations */
 
 
 
@@ -598,7 +598,7 @@ static struct net_if *get_ethernet_iface(void)
 }
 
 
-/* This part belongs to CELLULAR - START: functions */
+/* *** This part belongs to CELLULAR - START: functions */
 static struct net_if *get_ppp_iface(void)
 {
     struct net_if *tmp;
@@ -756,7 +756,7 @@ static void app_sms_event_dispatch(const struct tb45_sms_event *event, void *use
 
 #endif
 
-/* This part belongs to CELLULAR - END: functions */
+/* *** This part belongs to CELLULAR - END: functions */
 
 
 static void handle_ipv4_result(struct net_if *iface)
@@ -798,7 +798,7 @@ static void handle_ipv4_result(struct net_if *iface)
         }
 
 
-/* This part belongs to CELLULAR - START: ppp_iface */
+/* *** This part belongs to CELLULAR - START: ppp_iface */
         if (iface == get_ppp_iface()) {
             LOG_INF("PPP IPCP Interface is UP!");
             struct interface_set_params msg = { .interface = 3, .state = true };
@@ -806,7 +806,7 @@ static void handle_ipv4_result(struct net_if *iface)
             k_work_submit_to_queue(&low_priority_wq, &interface_set_work);
             ppp_if_ready = true;
         }
-/* This part belongs to CELLULAR - END: ppp_iface */
+/* *** This part belongs to CELLULAR - END: ppp_iface */
     }
 }        
 
@@ -834,12 +834,12 @@ static void net_evt_handler(struct net_mgmt_event_callback *cb,
             } else if (iface == net_if_get_first_wifi()) {
                 interface_num = 2;
 
-/* This part belongs to CELLULAR - START: ppp_iface */
+/* *** This part belongs to CELLULAR - START: ppp_iface */
             } else if (iface == get_ppp_iface()) {
                 interface_num = 3;
                 ppp_if_ready = false;
             }
-/* This part belongs to CELLULAR - END: ppp_iface */
+/* *** This part belongs to CELLULAR - END: ppp_iface */
 
             struct interface_set_params msg = { .interface = interface_num, .state = false };
             k_msgq_put(&interface_set_msgq, &msg, K_NO_WAIT);
@@ -1097,6 +1097,23 @@ static void boot() {
     
     socket_mgr_init();
 
+
+/* *** This part belongs to CELLULAR - START: initialization */
+/* NOTE: This must stay near the start of boot(): the custom work queues
+ *  are ready here, so the modem startup event can be dispatched immediately.
+ * Moving this block to the bottom of boot() lets unrelated initialization
+ *  delay the modem state machine and can make the startup appear incomplete.
+ */
+    tb45_cellular_init(&cellular_cfg);
+
+    /* Added for Cellular - SMS */
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+    (void)tb45_sms_event_init();
+    (void)tb45_sms_event_set_callback(app_sms_event_dispatch, NULL);
+#endif
+/* *** This part belongs to CELLULAR - END: initialization */
+
+
     net_mgmt_init_event_callback(&net_l4_mgmt_cb, &net_evt_handler, NET_L4_EVENT_MASK);
     net_mgmt_add_event_callback(&net_l4_mgmt_cb);
     
@@ -1192,17 +1209,6 @@ static void init_work_handler(struct k_work *work) {
 
 int main(void)
 {
-/* This part belongs to CELLULAR - START: initialization */
-    tb45_cellular_init(&cellular_cfg);
-
-    /* Added for Cellular - SMS */
-#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
-    (void)tb45_sms_event_init();
-    (void)tb45_sms_event_set_callback(app_sms_event_dispatch, NULL);
-#endif
-/* This part belongs to CELLULAR - END: initialization */
-
-
 	k_work_init_delayable(&init_work, init_work_handler);
 	k_work_schedule_for_queue(&mid_priority_wq, &init_work, K_MSEC(1));
 
