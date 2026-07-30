@@ -64,6 +64,22 @@ extern "C" time_t timeutil_timegm(const struct tm *tm);
 #include "utils.h"
 #include "system.h"
 #include <cmath>
+
+
+/* This part belongs to CELLULAR - START: includes */
+#include <cstdlib>
+#include <zephyr/devicetree.h>
+#include "tb45_cellular.h"
+#include "tb45_ping.h"
+
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+#include "tb45_sms.h"
+#include "tb45_sms_event.h"
+#endif
+
+/* This part belongs to CELLULAR - END: includes */
+
+
 LOG_MODULE_REGISTER(app);
 
 
@@ -267,6 +283,40 @@ struct k_work mdbutton_released_work;
 
 static bool dhcp_enabled = false;
 
+
+
+/* This part belongs to CELLULAR - START: globals, constants, and declarations */
+
+/* Cellular runtime config */
+/* NOTE: should you see this warning: <wrn> modem_cellular_custom: AT+COPS failed for carrier_id 46692 (: 30); continuing with modem default operator selection 
+ *   then it means that the carrier_id will switch to using AUTO mode.
+ * Chunghwa APN: internet
+ * onomondo APN: onomondo
+ * 1NCE APN: iot.1nce.net
+ *
+*/
+static const struct tb45_cellular_config cellular_cfg = {
+    .apn      = "internet",
+    .username = NULL,
+    .password = NULL,
+    .auth_type = TB45_CELL_AUTH_NONE,
+    .sim_pin    = "0000",
+    .carrier_id = "AUTO",   // Default: AUTO
+    .wq         = &low_priority_wq,
+};
+
+/* Cellular state and helper declarations */
+bool ppp_if_ready = false;
+
+static struct net_if *get_ppp_iface(void);
+static void app_queue_ppp_ping_test(void);
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+static void app_sms_send_and_ping_test(void);
+static void app_sms_recover_stored_unread_messages(void);
+static void app_queue_ppp_sms_test_batch(void);
+#endif
+
+/* This part belongs to CELLULAR - END: globals, constants, and declarations */
 
 
 
@@ -547,6 +597,168 @@ static struct net_if *get_ethernet_iface(void)
     return net_if_get_default();
 }
 
+
+/* This part belongs to CELLULAR - START: functions */
+static struct net_if *get_ppp_iface(void)
+{
+    struct net_if *tmp;
+    for (int i = 1; (tmp = net_if_get_by_index(i)) != NULL; i++) {
+        if (net_if_l2(tmp) == &NET_L2_GET_NAME(PPP)) {
+            return tmp;
+        }
+    }
+    return NULL;
+}
+
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+
+/* Added for Cellular - SMS and PING TEST ONLY */
+/*
+ * This manual recovery checks LOCAL MODEM STORAGE (thus NOT from the tower) for unread SMS that may have
+ * already arrived but not yet been surfaced to the app. It does not fetch an
+ * SMS that is still being held upstream by the network/SMSC (=tower) during reboot or
+ * modem downtime.
+ */
+static void app_sms_recover_stored_unread_messages(void)
+{
+    int ret = tb45_sms_receive_recover_stored_unread_messages();
+
+    if (ret < 0) {
+        LOG_ERR("Manual stored-SMS recovery trigger failed (%d)", ret);
+    } else {
+        LOG_INF("Manual stored-SMS recovery requested");
+        LOG_INF("NOTE: If no SMS appears shortly,...");
+        LOG_INF("...the old SMS may not be in local modem storage yet.");
+        LOG_INF("REASON: this could be due to a System/Modem Reboot or network/SMSC delay.");
+        LOG_INF("In that case it can still arrive later via the normal SMS event path,...");
+        LOG_INF("...and this has taken up to about 4 minutes in testing.");
+    }
+}
+
+static void app_sms_send_and_ping_test(void)
+{
+    if (!ppp_if_ready) {
+        LOG_WRN("TEST ABORTED: PPP IPCP is not ready");
+        return;
+    } else {
+        app_queue_ppp_ping_test();
+    }
+    app_queue_ppp_sms_test_batch();
+}
+
+static void app_queue_ppp_sms_test_batch(void)
+{
+    const size_t num_sms = 4U;
+    struct tb45_sms_request sms_requests[num_sms];
+    int ret = 0;
+    (void)memset(sms_requests, 0, sizeof(sms_requests));
+
+    uint32_t next_sms_id = (uint32_t)k_uptime_get_32();
+    if (next_sms_id == 0U) {
+        next_sms_id = 1U;
+    }
+
+    for (size_t i = 0U; i < num_sms; i++) {
+        (void)snprintf(sms_requests[i].phone_number, sizeof(sms_requests[i].phone_number), "%s",
+                       "+886939919942");
+        sms_requests[i].message_id = next_sms_id++;
+        if (next_sms_id == 0U) {
+            next_sms_id = 1U;
+        }
+        (void)snprintf(sms_requests[i].message, sizeof(sms_requests[i].message),
+                       "tb45_sms_send_enqueue_wait: id=%u batch_idx=%u TB45 SMS_SEND Test",
+                       (unsigned int)sms_requests[i].message_id, (unsigned int)i);
+
+        LOG_INF("PPP IPCP up detected: sending SMS now (idx=%u id=%u)",
+                (unsigned int)i, sms_requests[i].message_id);
+
+        /*
+         * Previously this batch used `tb45_sms_send_enqueue_with_result_id()`, which is non-waiting.
+         * Instead tb45_sms_send_enqueue_wait() is used here to make sure that each SMS fully finishes before the next one is sent.
+        */
+        ret = tb45_sms_send_enqueue_wait(&sms_requests[i]);
+        if (ret == 0) {
+            LOG_INF("PPP IPCP up detected: SMS send completed (idx=%u id=%u)",
+                    (unsigned int)i, sms_requests[i].message_id);
+        } else {
+            LOG_ERR("PPP IPCP up detected: SMS send failed (idx=%u id=%u ret=%d)",
+                    (unsigned int)i, sms_requests[i].message_id, ret);
+        }
+    }
+}
+#endif
+
+static void app_queue_ppp_ping_test(void)
+{
+    int ret;
+    const char *ping_host = "8.8.8.8";
+
+    ret = tb45_ping_enqueue(ping_host, 0U, 0U);
+    if (ret == 0) {
+        LOG_INF("PPP IPCP up detected: PING request queued (%s)", ping_host);
+    } else {
+        LOG_ERR("PPP IPCP up detected: PING queue failed (%d)", ret);
+    }
+}
+
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+static void app_sms_send_event_handler(const struct tb45_sms_event *event)
+{
+    if (event == NULL) {
+        return;
+    }
+    if (event->type == TB45_SMS_EVENT_TYPE_SEND_MSG_STATUS) {
+        if (event->status == 0) {
+            LOG_INF("[SMS_SND] send_ok id=%u phone=%s",
+                    event->data.send.message_id, event->data.send.phone);
+        } else {
+            LOG_ERR("[SMS_SND] send_fail id=%u rc=%d phone=%s",
+                    event->data.send.message_id, event->status, event->data.send.phone);
+        }
+    }
+}
+
+static void app_sms_receive_event_handler(const struct tb45_sms_event *event)
+{
+    if (event == NULL) {
+        return;
+    }
+    if (event->type == TB45_SMS_EVENT_TYPE_RECEIVE_MSG_OUTPUT) {
+        if (event->status == 0) {
+            struct tb45_sms_rx_message message;
+            int ret = tb45_sms_receive_read_index(event->data.receive.storage_index, &message);
+
+            if (ret == 0) {
+                LOG_INF("[%s]:<%s>:%s",
+                        message.phone, message.timestamp, message.message);
+
+                ret = tb45_sms_receive_delete_index(event->data.receive.storage_index);
+                if (ret < 0) {
+                    LOG_ERR("[SMS_RCV] delete enqueue failed idx=%u rc=%d",
+                            event->data.receive.storage_index, ret);
+                }
+            } else {
+                LOG_ERR("[SMS_RCV] read failed idx=%u rc=%d",
+                        event->data.receive.storage_index, ret);
+            }
+        } else {
+            LOG_ERR("[SMS_RCV] failed idx=%u rc=%d", event->data.receive.storage_index, event->status);
+        }
+    }
+}
+
+static void app_sms_event_dispatch(const struct tb45_sms_event *event, void *user_data)
+{
+    ARG_UNUSED(user_data);
+    app_sms_send_event_handler(event);
+    app_sms_receive_event_handler(event);
+}
+
+#endif
+
+/* This part belongs to CELLULAR - END: functions */
+
+
 static void handle_ipv4_result(struct net_if *iface)
 {
     int i = 0;
@@ -584,7 +796,17 @@ static void handle_ipv4_result(struct net_if *iface)
             k_work_submit_to_queue(&mid_priority_wq, &interface_set_work);
             net_if_ready = true;
         }
-        
+
+
+/* This part belongs to CELLULAR - START: ppp_iface */
+        if (iface == get_ppp_iface()) {
+            LOG_INF("PPP IPCP Interface is UP!");
+            struct interface_set_params msg = { .interface = 3, .state = true };
+            (void)k_msgq_put(&interface_set_msgq, &msg, K_NO_WAIT);
+            k_work_submit_to_queue(&low_priority_wq, &interface_set_work);
+            ppp_if_ready = true;
+        }
+/* This part belongs to CELLULAR - END: ppp_iface */
     }
 }        
 
@@ -611,7 +833,13 @@ static void net_evt_handler(struct net_mgmt_event_callback *cb,
                 interface_num = 1;
             } else if (iface == net_if_get_first_wifi()) {
                 interface_num = 2;
+
+/* This part belongs to CELLULAR - START: ppp_iface */
+            } else if (iface == get_ppp_iface()) {
+                interface_num = 3;
+                ppp_if_ready = false;
             }
+/* This part belongs to CELLULAR - END: ppp_iface */
 
             struct interface_set_params msg = { .interface = interface_num, .state = false };
             k_msgq_put(&interface_set_msgq, &msg, K_NO_WAIT);
@@ -684,7 +912,15 @@ void mdbutton_pressed_handler(struct k_work *work) {
 }
 
 void mdbutton_released_handler(struct k_work *work) {
-    
+    ARG_UNUSED(work);
+// #if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+//     app_sms_send_and_ping_test();
+//     app_sms_recover_stored_unread_messages();
+// #else
+//     if (ppp_if_ready) {
+//         app_queue_ppp_ping_test();
+//     }
+// #endif
 }
 
 
@@ -860,7 +1096,7 @@ static void boot() {
     
     
     socket_mgr_init();
-    
+
     net_mgmt_init_event_callback(&net_l4_mgmt_cb, &net_evt_handler, NET_L4_EVENT_MASK);
     net_mgmt_add_event_callback(&net_l4_mgmt_cb);
     
@@ -956,6 +1192,17 @@ static void init_work_handler(struct k_work *work) {
 
 int main(void)
 {
+/* This part belongs to CELLULAR - START: initialization */
+    tb45_cellular_init(&cellular_cfg);
+
+    /* Added for Cellular - SMS */
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+    (void)tb45_sms_event_init();
+    (void)tb45_sms_event_set_callback(app_sms_event_dispatch, NULL);
+#endif
+/* This part belongs to CELLULAR - END: initialization */
+
+
 	k_work_init_delayable(&init_work, init_work_handler);
 	k_work_schedule_for_queue(&mid_priority_wq, &init_work, K_MSEC(1));
 
