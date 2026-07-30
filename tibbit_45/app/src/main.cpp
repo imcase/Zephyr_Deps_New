@@ -913,14 +913,14 @@ void mdbutton_pressed_handler(struct k_work *work) {
 
 void mdbutton_released_handler(struct k_work *work) {
     ARG_UNUSED(work);
-// #if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
-//     app_sms_send_and_ping_test();
-//     app_sms_recover_stored_unread_messages();
-// #else
-//     if (ppp_if_ready) {
-//         app_queue_ppp_ping_test();
-//     }
-// #endif
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+    app_sms_send_and_ping_test();
+    app_sms_recover_stored_unread_messages();
+#else
+    if (ppp_if_ready) {
+        app_queue_ppp_ping_test();
+    }
+#endif
 }
 
 
