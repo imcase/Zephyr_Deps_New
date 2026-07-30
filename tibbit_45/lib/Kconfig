@@ -1,0 +1,11 @@
+menu "Custom libraries"
+
+rsource "tibbit_45/Kconfig"
+
+# rsource "custom/Kconfig"
+
+
+rsource "log_udp/Kconfig"
+
+
+endmenu

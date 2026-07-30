@@ -1,0 +1,180 @@
+
+#include <zephyr/dt-bindings/pwm/pwm.h>
+
+
+
+&usart1 {
+    status = "disabled";
+};
+&usart2 {
+    status = "disabled";
+};
+&usart3 {
+    status = "disabled";
+};
+&usart6 {
+    status = "disabled";
+};
+&uart4 {
+    status = "disabled";
+};
+&uart5 {
+    status = "disabled";
+};
+&spi2 {
+    status = "disabled";
+};
+&spi3 {
+    status = "disabled";
+};
+&i2c1 {
+    status = "disabled";
+};
+&i2c2 {
+    status = "disabled";
+};
+&i2c3 {
+    status = "disabled";
+};
+&adc1 {
+    status = "disabled";
+};
+&dac1 {
+    status = "disabled";
+};
+&pwm1 {
+    status = "disabled";
+};
+&pwm3 {
+    status = "disabled";
+};
+&pwm4 {
+    status = "disabled";
+};
+&pwm12 {
+    status = "disabled";
+};
+
+/* Enable TIM5 for buzzer PWM output on PA0 */
+&timers5 {
+    status = "okay";
+    st,prescaler = <0>;
+
+    pwm5: pwm {
+        status = "okay";
+        pinctrl-0 = <&tim5_ch1_pa0>;
+        pinctrl-names = "default";
+    };
+};
+
+
+/ {
+	    
+    aliases {
+        buzzer-pwm = &buzzer_pwm_dev;
+        modem-uart = &t01_s1_serial;
+        modem = &tb45_modem;
+    };
+    
+    buzzer_pwm_dev: buzzer {
+        compatible = "pwm-leds";
+        buzzer_pwm: buzzer_pwm {
+            pwms = <&pwm5 1 PWM_USEC(100) PWM_POLARITY_NORMAL>;
+            label = "Buzzer PWM";
+        };
+    };
+
+
+	chosen {
+		zephyr,console = &t01_s5_serial;
+		zephyr,shell-uart = &t01_s5_serial;
+		zephyr,modem-uart = &t01_s1_serial;
+
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		
+	};
+
+    /*
+     * Tibbit #45 signal wiring (from schematic red-number mapping):
+     * S1 gpio9  -> TX      -> PD5 (USART2 TX)
+     * S1 gpio8  -> RX      -> PD6 (USART2 RX)
+     * S1 gpio0  -> RTS     -> PA3 (GPIO flow-control output)
+     * S1 gpio16 -> CTS     -> PD8 (GPIO flow-control input)
+     * S3 gpio11 -> -SDWN   -> PC10
+     * S3 gpio10 -> PWRKEY  -> PC11
+     * S3 gpio1  -> RESET   -> PA4
+     * S3 gpio17 -> STATUS  -> PD9
+     */
+    tb45_signals {
+        /*
+         * Plain app-owned GPIO descriptors. This custom compatible has no
+         * runtime driver; it only provides a binding so `gpios` properties are
+         * available to GPIO_DT_SPEC_GET().
+         */
+        compatible = "simcom,tb45-signals";
+
+        tb45_rts: tb45_rts {
+            gpios = <&gpioa 3 GPIO_ACTIVE_LOW>;
+        };
+
+        tb45_cts: tb45_cts {
+            gpios = <&gpiod 8 GPIO_ACTIVE_LOW>;
+        };
+
+        tb45_sdwn: tb45_sdwn {
+            gpios = <&gpioc 10 GPIO_ACTIVE_HIGH>;
+        };
+
+        tb45_pwrkey: tb45_pwrkey {
+            gpios = <&gpioc 11 GPIO_ACTIVE_HIGH>;
+        };
+
+        tb45_reset: tb45_reset {
+            gpios = <&gpioa 4 GPIO_ACTIVE_HIGH>;
+        };
+
+        tb45_status: tb45_status {
+            gpios = <&gpiod 9 GPIO_ACTIVE_HIGH>;
+        };
+    };
+};
+
+
+t01_s1_serial: &usart2 {
+    // pinctrl-0 = <&usart2_tx_pd5 &usart2_rx_pd6>;// already set in tpp.dtsi
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+
+	tb45_modem: modem {
+		compatible = "simcom,sim7080-custom";
+		status = "okay";
+
+		/* TB45 control-line mapping for modem_cellular driver */
+		mdm-power-gpios = <&gpioc 11 GPIO_ACTIVE_HIGH>; /* PWRKEY */
+		mdm-wake-gpios  = <&gpioc 10 GPIO_ACTIVE_HIGH>; /* -SDWN */
+	};
+
+};
+    
+
+t01_s5_serial: &uart5 {
+    // pinctrl-0 = <&usart2_tx_pd5 &usart2_rx_pd6>;// already set in tpp.dtsi
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
+    
+
+
+&pinctrl {
+	    
+    /* TIM5 Channel 1 on PA0 for buzzer */
+    tim5_ch1_pa0: tim5_ch1_pa0 {
+        pinmux = <STM32_PINMUX('A', 0, AF2)>;
+    };
+
+};
