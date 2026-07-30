@@ -92,8 +92,9 @@
 
 	};
 
-	buttons {
+	gpio_buttons: gpio_buttons {
 		compatible = "gpio-keys";
+		debounce-interval-ms = <30>;
 		
 	};
 

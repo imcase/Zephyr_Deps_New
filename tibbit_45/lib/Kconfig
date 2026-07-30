@@ -1,11 +1,15 @@
 menu "Custom libraries"
 
-rsource "tibbit_45/Kconfig"
-
 # rsource "custom/Kconfig"
 
 
+rsource "socket_mgr/Kconfig"
+
+rsource "udp_fwloader/Kconfig"
+
 rsource "log_udp/Kconfig"
 
+
+rsource "tibbit_45/Kconfig"
 
 endmenu

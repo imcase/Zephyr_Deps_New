@@ -1,0 +1,15 @@
+menu "Zephyr"
+    source "Kconfig.zephyr"
+
+    config MODEM_PPP_CUSTOM_LOGGING_ENABLE
+        bool "Enable custom modem PPP logging"
+        default y
+        help
+          Enable debug logging from the project custom modem PPP implementation.
+          Disable this to keep PPP functionality while compiling out PPP logs.
+
+endmenu
+
+module = APP
+module-str = APP
+source "subsys/logging/Kconfig.template.log_config"
