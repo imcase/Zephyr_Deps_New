@@ -71,6 +71,7 @@ extern "C" time_t timeutil_timegm(const struct tm *tm);
 #include <zephyr/devicetree.h>
 #include "tb45_cellular.h"
 #include "tb45_ping.h"
+#include "tb45_async_job_internal.h"
 
 #if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
 #include "tb45_sms.h"
@@ -279,6 +280,7 @@ static const struct gpio_dt_spec mdbutton =
 static struct gpio_callback mdbutton_cb_data;
 struct k_work mdbutton_pressed_work;
 struct k_work mdbutton_released_work;
+
             
 
 static bool dhcp_enabled = false;
@@ -489,6 +491,14 @@ static int preinit(void)
     
     
     work_queues_init();
+
+/* *** This part belongs to CELLULAR - START: Async Dispatcher */
+    /* The async dispatcher starts at POST_KERNEL, before application work
+     * queues exist. Re-arm it now so jobs enqueued by the app are consumed on
+     * low_priority_wq. */
+    tb45_async_dispatcher_work_queues_ready();
+/* *** This part belongs to CELLULAR - END: Async Dispatcher */
+
     k_work_init(&interface_set_work, interface_set_work_handler);
     
     
@@ -650,7 +660,8 @@ static void app_queue_ppp_sms_test_batch(void)
 {
     const size_t num_sms = 4U;
     struct tb45_sms_request sms_requests[num_sms];
-    int ret = 0;
+    int ret;
+
     (void)memset(sms_requests, 0, sizeof(sms_requests));
 
     uint32_t next_sms_id = (uint32_t)k_uptime_get_32();
@@ -666,24 +677,16 @@ static void app_queue_ppp_sms_test_batch(void)
             next_sms_id = 1U;
         }
         (void)snprintf(sms_requests[i].message, sizeof(sms_requests[i].message),
-                       "tb45_sms_send_enqueue_wait: id=%u batch_idx=%u TB45 SMS_SEND Test",
+                       "tb45_sms_batch: id=%u batch_idx=%u TB45 SMS_SEND Test",
                        (unsigned int)sms_requests[i].message_id, (unsigned int)i);
+    }
 
-        LOG_INF("PPP IPCP up detected: sending SMS now (idx=%u id=%u)",
-                (unsigned int)i, sms_requests[i].message_id);
-
-        /*
-         * Previously this batch used `tb45_sms_send_enqueue_with_result_id()`, which is non-waiting.
-         * Instead tb45_sms_send_enqueue_wait() is used here to make sure that each SMS fully finishes before the next one is sent.
-        */
-        ret = tb45_sms_send_enqueue_wait(&sms_requests[i]);
-        if (ret == 0) {
-            LOG_INF("PPP IPCP up detected: SMS send completed (idx=%u id=%u)",
-                    (unsigned int)i, sms_requests[i].message_id);
-        } else {
-            LOG_ERR("PPP IPCP up detected: SMS send failed (idx=%u id=%u ret=%d)",
-                    (unsigned int)i, sms_requests[i].message_id, ret);
-        }
+    ret = tb45_sms_send_batch_start(sms_requests, num_sms);
+    if (ret == 0) {
+        LOG_INF("PPP IPCP up detected: SMS batch accepted count=%u",
+                (unsigned int)num_sms);
+    } else {
+        LOG_ERR("PPP IPCP up detected: SMS batch start failed (%d)", ret);
     }
 }
 #endif
@@ -914,8 +917,10 @@ void mdbutton_pressed_handler(struct k_work *work) {
 void mdbutton_released_handler(struct k_work *work) {
     ARG_UNUSED(work);
 #if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
-    app_sms_send_and_ping_test();
-    app_sms_recover_stored_unread_messages();
+    // app_queue_ppp_sms_test_batch();
+    // app_sms_send_and_ping_test();
+    // app_sms_recover_stored_unread_messages();
+    app_queue_ppp_ping_test();
 #else
     if (ppp_if_ready) {
         app_queue_ppp_ping_test();
