@@ -12,7 +12,6 @@
 
 #include <zephyr/linker/section_tags.h>
 #include <zephyr/sys/reboot.h>
-#include <zephyr/sys/atomic.h>
 #include "work_queues.h"
 
 
@@ -311,26 +310,12 @@ static const struct tb45_cellular_config cellular_cfg = {
 /* Cellular state and helper declarations */
 bool ppp_if_ready = false;
 
-#define APP_SMS_SEQUENCE_MAX_MESSAGES       4U
-#define APP_SMS_SEQUENCE_POLL_MS            250U
-#define APP_SMS_SEQUENCE_TIMEOUT_MARGIN_MS  5000U
+#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
+#define APP_SMS_SEQUENCE_MAX_MESSAGES 4U
 
-enum app_sms_sequence_state {
-    APP_SMS_SEQUENCE_IDLE = 0,
-    APP_SMS_SEQUENCE_WAITING_RESULT,
-};
-
-/* The application owns this storage. The library handles one request at a
- * time, so the active message count remains an application decision. */
-static struct k_work_delayable app_sms_sequence_work;
+/* The application owns this persistent request storage and active count. */
 static struct tb45_sms_request app_sms_sequence_requests[APP_SMS_SEQUENCE_MAX_MESSAGES];
-static enum app_sms_sequence_state app_sms_sequence_state = APP_SMS_SEQUENCE_IDLE;
-static atomic_t app_sms_sequence_active = ATOMIC_INIT(0);
-static bool app_sms_sequence_waiting = false;
-static size_t app_sms_sequence_count = 0U;
-static size_t app_sms_sequence_index = 0U;
-static uint32_t app_sms_sequence_active_id = 0U;
-static int64_t app_sms_sequence_deadline_ms = 0;
+#endif
 
 static struct net_if *get_ppp_iface(void);
 static void app_queue_ppp_ping_test(void);
@@ -338,9 +323,6 @@ static void app_queue_ppp_ping_test(void);
 static void app_sms_send_and_ping_test(void);
 static void app_sms_queue_test(void);
 static void app_sms_recover_stored_unread_messages(void);
-static int app_sms_sequence_start(const struct tb45_sms_request *requests, size_t count);
-static void app_sms_sequence_work_handler(struct k_work *work);
-static void app_sms_sequence_handle_event(const struct tb45_sms_event *event);
 #endif
 
 /* *** This part belongs to CELLULAR - END: globals, constants, and declarations */
@@ -522,9 +504,6 @@ static int preinit(void)
      * queues exist. Re-arm it now so jobs enqueued by the app are consumed on
      * low_priority_wq. */
     tb45_async_dispatcher_work_queues_ready();
-#if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
-    k_work_init_delayable(&app_sms_sequence_work, app_sms_sequence_work_handler);
-#endif
 /* *** This part belongs to CELLULAR - END: Async Dispatcher */
 
     k_work_init(&interface_set_work, interface_set_work_handler);
@@ -679,7 +658,7 @@ static void app_sms_send_and_ping_test(void)
         LOG_WRN("TEST ABORTED: PPP IPCP is not ready");
         return;
     }
-    if (atomic_get(&app_sms_sequence_active) != 0) {
+    if (tb45_sms_sequence_is_active()) {
         LOG_WRN("SMS sequence already active; ignoring duplicate MD-button release");
         return;
     }
@@ -691,12 +670,11 @@ static void app_sms_send_and_ping_test(void)
 
 static void app_sms_queue_test(void)
 {
-    struct tb45_sms_request sms_requests[APP_SMS_SEQUENCE_MAX_MESSAGES];
     const size_t num_sms = APP_SMS_SEQUENCE_MAX_MESSAGES;
     uint32_t next_sms_id;
     int ret;
 
-    (void)memset(sms_requests, 0, sizeof(sms_requests));
+    (void)memset(app_sms_sequence_requests, 0, sizeof(app_sms_sequence_requests));
 
     next_sms_id = (uint32_t)k_uptime_get_32();
     if (next_sms_id == 0U) {
@@ -704,18 +682,18 @@ static void app_sms_queue_test(void)
     }
 
     for (size_t i = 0U; i < num_sms; i++) {
-        (void)snprintf(sms_requests[i].phone_number, sizeof(sms_requests[i].phone_number), "%s",
+        (void)snprintf(app_sms_sequence_requests[i].phone_number, sizeof(app_sms_sequence_requests[i].phone_number), "%s",
                        "+886939919942");
-        sms_requests[i].message_id = next_sms_id++;
+        app_sms_sequence_requests[i].message_id = next_sms_id++;
         if (next_sms_id == 0U) {
             next_sms_id = 1U;
         }
-        (void)snprintf(sms_requests[i].message, sizeof(sms_requests[i].message),
+        (void)snprintf(app_sms_sequence_requests[i].message, sizeof(app_sms_sequence_requests[i].message),
                        "tb45_sms_sequence: id=%u batch_idx=%u TB45 SMS_SEND Test",
-                       (unsigned int)sms_requests[i].message_id, (unsigned int)i);
+                       (unsigned int)app_sms_sequence_requests[i].message_id, (unsigned int)i);
     }
 
-    ret = app_sms_sequence_start(sms_requests, num_sms);
+    ret = tb45_sms_sequence_start(app_sms_sequence_requests, num_sms);
     if (ret == 0) {
         LOG_INF("PPP IPCP up detected: SMS sequence accepted count=%u",
                 (unsigned int)num_sms);
@@ -724,179 +702,6 @@ static void app_sms_queue_test(void)
     }
 }
 
-static int app_sms_sequence_schedule(uint32_t delay_ms)
-{
-    if (k_work_queue_thread_get(&low_priority_wq) == NULL) {
-        return -EAGAIN;
-    }
-
-    return k_work_reschedule_for_queue(&low_priority_wq, &app_sms_sequence_work,
-                                       K_MSEC(delay_ms));
-}
-
-static int64_t app_sms_sequence_timeout_ms(void)
-{
-    uint64_t attempts = 1U + CONFIG_APP_TB45_SMS_SEND_MAX_RETRIES;
-    uint64_t timeout_ms = attempts * CONFIG_APP_TB45_SMS_SEND_ATTEMPT_TIMEOUT_MS;
-
-    if (attempts > 1U) {
-        timeout_ms += (attempts - 1U) * CONFIG_APP_TB45_SMS_SEND_RETRY_DELAY_MS;
-    }
-
-    timeout_ms += APP_SMS_SEQUENCE_TIMEOUT_MARGIN_MS;
-    return (timeout_ms > INT64_MAX) ? INT64_MAX : (int64_t)timeout_ms;
-}
-
-static void app_sms_sequence_finish(int ret)
-{
-    if (ret == 0) {
-        LOG_INF("[SMS_SEQ] completed count=%u", (unsigned int)app_sms_sequence_count);
-    } else {
-        LOG_ERR("[SMS_SEQ] stopped idx=%u id=%u rc=%d",
-                (unsigned int)app_sms_sequence_index,
-                app_sms_sequence_active_id, ret);
-    }
-
-    app_sms_sequence_state = APP_SMS_SEQUENCE_IDLE;
-    app_sms_sequence_waiting = false;
-    app_sms_sequence_active_id = 0U;
-    app_sms_sequence_deadline_ms = 0;
-    atomic_set(&app_sms_sequence_active, 0);
-}
-
-static int app_sms_sequence_start(const struct tb45_sms_request *requests, size_t count)
-{
-    if ((requests == NULL) || (count == 0U) ||
-        (count > APP_SMS_SEQUENCE_MAX_MESSAGES)) {
-        return -EINVAL;
-    }
-
-    if (!atomic_cas(&app_sms_sequence_active, 0, 1)) {
-        return -EBUSY;
-    }
-
-    for (size_t i = 0U; i < count; i++) {
-        if (requests[i].message_id == 0U) {
-            atomic_set(&app_sms_sequence_active, 0);
-            return -EINVAL;
-        }
-        app_sms_sequence_requests[i] = requests[i];
-    }
-
-    app_sms_sequence_count = count;
-    app_sms_sequence_index = 0U;
-    app_sms_sequence_active_id = 0U;
-    app_sms_sequence_waiting = false;
-    app_sms_sequence_deadline_ms = 0;
-    app_sms_sequence_state = APP_SMS_SEQUENCE_IDLE;
-
-    /*
-     * How does this work?
-     *
-     * app_sms_sequence_start(): starts the sequence
-     *      ↓
-     * app_sms_sequence_schedule(0): schedules the next state-machine step
-     *      ↓
-     * low_priority_wq runs app_sms_sequence_work_handler(): calls the SMS enqueue API
-     *      ↓
-     * tb45_sms_send_enqueue_with_result_id()
-     *      ↓
-     * wait logically for SMS result event
-     *      ↓
-     * schedule next message
-    */
-    int ret = app_sms_sequence_schedule(0U);
-    
-    if (ret < 0) {
-        atomic_set(&app_sms_sequence_active, 0);
-        return ret;
-    }
-
-    return 0;
-}
-
-static void app_sms_sequence_work_handler(struct k_work *work)
-{
-    ARG_UNUSED(work);
-
-    if (atomic_get(&app_sms_sequence_active) == 0) {
-        return;
-    }
-
-    int64_t now_ms = k_uptime_get();
-    if ((app_sms_sequence_deadline_ms != 0) &&
-        (now_ms >= app_sms_sequence_deadline_ms)) {
-        app_sms_sequence_finish(-ETIMEDOUT);
-        return;
-    }
-
-    if (app_sms_sequence_state == APP_SMS_SEQUENCE_WAITING_RESULT) {
-        (void)app_sms_sequence_schedule(APP_SMS_SEQUENCE_POLL_MS);
-        return;
-    }
-
-    if (app_sms_sequence_index >= app_sms_sequence_count) {
-        app_sms_sequence_finish(0);
-        return;
-    }
-
-    const struct tb45_sms_request *request =
-        &app_sms_sequence_requests[app_sms_sequence_index];
-    app_sms_sequence_active_id = request->message_id;
-    if (app_sms_sequence_deadline_ms == 0) {
-        app_sms_sequence_deadline_ms = now_ms + app_sms_sequence_timeout_ms();
-    }
-
-    int ret = tb45_sms_send_enqueue_with_result_id(request);
-    if (ret == -EAGAIN) {
-        /* Retry later without blocking low_priority_wq or advancing the
-         * sequence while the shared async queue is temporarily full. */
-        (void)app_sms_sequence_schedule(APP_SMS_SEQUENCE_POLL_MS);
-        return;
-    }
-    if (ret < 0) {
-        app_sms_sequence_finish(ret);
-        return;
-    }
-
-    app_sms_sequence_waiting = true;
-    app_sms_sequence_state = APP_SMS_SEQUENCE_WAITING_RESULT;
-    LOG_INF("[SMS_SEQ] queued idx=%u id=%u",
-            (unsigned int)app_sms_sequence_index, app_sms_sequence_active_id);
-    (void)app_sms_sequence_schedule(APP_SMS_SEQUENCE_POLL_MS);
-}
-
-static void app_sms_sequence_handle_event(const struct tb45_sms_event *event)
-{
-    if ((event == NULL) || (event->type != TB45_SMS_EVENT_TYPE_SEND_MSG_STATUS) ||
-        (atomic_get(&app_sms_sequence_active) == 0) ||
-        !app_sms_sequence_waiting ||
-        (event->data.send.message_id != app_sms_sequence_active_id)) {
-        return;
-    }
-
-    app_sms_sequence_waiting = false;
-    LOG_INF("[SMS_SEQ] result idx=%u id=%u rc=%d",
-            (unsigned int)app_sms_sequence_index,
-            app_sms_sequence_active_id, event->status);
-
-    if (event->status != 0) {
-        app_sms_sequence_finish(event->status);
-        return;
-    }
-
-    app_sms_sequence_index++;
-    app_sms_sequence_state = APP_SMS_SEQUENCE_IDLE;
-    app_sms_sequence_active_id = 0U;
-    app_sms_sequence_deadline_ms = 0;
-
-    if (app_sms_sequence_index >= app_sms_sequence_count) {
-        app_sms_sequence_finish(0);
-        return;
-    }
-
-    (void)app_sms_sequence_schedule(0U);
-}
 #endif
 
 static void app_queue_ppp_ping_test(void)
@@ -918,7 +723,6 @@ static void app_sms_send_event_handler(const struct tb45_sms_event *event)
     if (event == NULL) {
         return;
     }
-    app_sms_sequence_handle_event(event);
     if (event->type == TB45_SMS_EVENT_TYPE_SEND_MSG_STATUS) {
         if (event->status == 0) {
             LOG_INF("[SMS_SND] send_ok id=%u phone=%s",
