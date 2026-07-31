@@ -336,6 +336,7 @@ static struct net_if *get_ppp_iface(void);
 static void app_queue_ppp_ping_test(void);
 #if defined(CONFIG_APP_TB45_SMS_ENABLE) && CONFIG_APP_TB45_SMS_ENABLE
 static void app_sms_send_and_ping_test(void);
+static void app_sms_queue_test(void);
 static void app_sms_recover_stored_unread_messages(void);
 static int app_sms_sequence_start(const struct tb45_sms_request *requests, size_t count);
 static void app_sms_sequence_work_handler(struct k_work *work);
@@ -674,11 +675,6 @@ static void app_sms_recover_stored_unread_messages(void)
 
 static void app_sms_send_and_ping_test(void)
 {
-    struct tb45_sms_request sms_requests[APP_SMS_SEQUENCE_MAX_MESSAGES];
-    const size_t num_sms = APP_SMS_SEQUENCE_MAX_MESSAGES;
-    uint32_t next_sms_id;
-    int ret;
-
     if (!ppp_if_ready) {
         LOG_WRN("TEST ABORTED: PPP IPCP is not ready");
         return;
@@ -688,8 +684,19 @@ static void app_sms_send_and_ping_test(void)
         return;
     }
 
-    (void)memset(sms_requests, 0, sizeof(sms_requests));
+    /* Preserve the original combined-test order: queue ping, then start SMS. */
     app_queue_ppp_ping_test();
+    app_sms_queue_test();
+}
+
+static void app_sms_queue_test(void)
+{
+    struct tb45_sms_request sms_requests[APP_SMS_SEQUENCE_MAX_MESSAGES];
+    const size_t num_sms = APP_SMS_SEQUENCE_MAX_MESSAGES;
+    uint32_t next_sms_id;
+    int ret;
+
+    (void)memset(sms_requests, 0, sizeof(sms_requests));
 
     next_sms_id = (uint32_t)k_uptime_get_32();
     if (next_sms_id == 0U) {
@@ -783,7 +790,23 @@ static int app_sms_sequence_start(const struct tb45_sms_request *requests, size_
     app_sms_sequence_deadline_ms = 0;
     app_sms_sequence_state = APP_SMS_SEQUENCE_IDLE;
 
+    /*
+     * How does this work?
+     *
+     * app_sms_sequence_start(): starts the sequence
+     *      ↓
+     * app_sms_sequence_schedule(0): schedules the next state-machine step
+     *      ↓
+     * low_priority_wq runs app_sms_sequence_work_handler(): calls the SMS enqueue API
+     *      ↓
+     * tb45_sms_send_enqueue_with_result_id()
+     *      ↓
+     * wait logically for SMS result event
+     *      ↓
+     * schedule next message
+    */
     int ret = app_sms_sequence_schedule(0U);
+    
     if (ret < 0) {
         atomic_set(&app_sms_sequence_active, 0);
         return ret;
