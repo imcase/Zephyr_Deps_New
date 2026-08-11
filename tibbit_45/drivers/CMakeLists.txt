@@ -1,1 +1,0 @@
-add_subdirectory_ifdef(CONFIG_MODEM_MODULES modem_cellular_custom)
